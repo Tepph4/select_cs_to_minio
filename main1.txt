@@ -1,0 +1,603 @@
+package main
+
+import (
+	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"database/sql"
+	"encoding/csv"
+	"encoding/hex"
+	"fmt"
+	"log"
+	"os"
+	"os/user"
+	"strconv"
+	"strings"
+	"time"
+
+	_ "github.com/denisenkom/go-mssqldb"
+	"github.com/joho/godotenv"
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
+)
+
+func formatNullableFloat(f *float64) string {
+	if f == nil {
+		return ""
+	}
+	return fmt.Sprintf("%f", *f)
+}
+
+func writeToFile(filename, data string) {
+	f, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Println("Failed to open file ", filename, err)
+	}
+	defer f.Close()
+
+	if _, err := f.WriteString(data + "\n"); err != nil {
+		fmt.Println("Failed to write to file ", filename, err)
+	}
+}
+
+func generate_csv(connectionString string, trdKeyMin int64, skmKeyMin int64) (string, string, int64, int64, error) {
+
+	conn, err := sql.Open("sqlserver", connectionString)
+	if err != nil {
+		fmt.Println("Error creating connection pool: ", err.Error())
+	}
+	defer conn.Close()
+
+	err = conn.Ping()
+	if err != nil {
+		fmt.Println("Error establishing connection: ", err.Error())
+	}
+	var trdKeyMax, skmKeyMax int64
+	err = conn.QueryRow("SELECT TOP(1) TRD_KEY FROM TRANSTKD ORDER BY TRD_KEY DESC").Scan(&trdKeyMax)
+	if err != nil {
+		return "", "", trdKeyMin, skmKeyMin, err
+	}
+	err = conn.QueryRow("SELECT TOP(1) SKM_KEY FROM SKUMOVE ORDER BY SKM_KEY DESC").Scan(&skmKeyMax)
+	if err != nil {
+		return "", "", trdKeyMin, skmKeyMin, err
+	}
+	if trdKeyMin == trdKeyMax && skmKeyMin == skmKeyMax {
+		fmt.Println("No new transactions or stock movements found.")
+		return "", "", trdKeyMin, skmKeyMin, err
+	} else {
+		query := `
+		use AgentThaiBev
+		SELECT SKU_CODE,SKU_BARCODE ,WH_CODE, WL_CODE, VAT, NON_VAT, VAT + NON_VAT AS SUM_QTY,UTQ_NAME,
+		SKU_NAME,
+		SKU_E_NAME
+		FROM (
+			SELECT
+				SKU_CODE,
+				GOODS_CODE AS SKU_BARCODE,
+				WH_CODE,
+				WL_CODE,
+				UTQ_NAME,
+				SKU_NAME,
+				SKU_E_NAME,
+				COUNT(*) AS CNT,
+				SUM(
+					CASE
+						WHEN (trd.TRD_WL = 1 AND trd.TRD_TO_WL = WL_KEY) AND (DI_REF LIKE 'DM%') AND (WL_CODE LIKE 'SALE0%') THEN trd.TRD_QTY * trd.TRD_UTQQTY
+						ELSE 0
+					END
+					-
+					CASE
+						WHEN (trd.TRD_WL = WL_KEY AND trd.TRD_TO_WL = 1) AND (DI_REF LIKE 'DM%') AND (WL_CODE LIKE 'SALE0%') THEN trd.TRD_QTY * trd.TRD_UTQQTY
+						ELSE 0
+					END
+					-
+					CASE
+						WHEN (trd.TRD_WL = WL_KEY) AND (WL_CODE LIKE 'SALE0%') AND (DI_REF LIKE 'CS%') THEN trd.TRD_QTY * trd.TRD_UTQQTY
+						ELSE 0
+					END
+				) AS VAT,
+				SUM(
+					CASE
+						WHEN (trd.TRD_WL = 109 AND trd.TRD_TO_WL = WL_KEY) AND (DI_REF LIKE 'DM%') AND (WL_CODE LIKE 'SALE0%') THEN trd.TRD_QTY * trd.TRD_UTQQTY
+						ELSE 0
+					END
+					-
+					CASE
+						WHEN (trd.TRD_WL = WL_KEY AND trd.TRD_TO_WL = 109) AND (DI_REF LIKE 'DM%') AND (WL_CODE LIKE 'SALE0%') THEN trd.TRD_QTY * trd.TRD_UTQQTY
+						ELSE 0
+					END
+					-
+					CASE
+						WHEN (trd.TRD_WL = WL_KEY) AND (WL_CODE LIKE 'SALE0%') AND (DI_REF LIKE 'NV%') THEN trd.TRD_QTY * trd.TRD_UTQQTY
+						ELSE 0
+					END
+				) AS NON_VAT
+			FROM
+				TRANSTKD AS trd
+				INNER JOIN TRANSTKH AS trh ON trd.TRD_TRH = trh.TRH_KEY
+				INNER JOIN DOCINFO AS di ON trh.TRH_DI = di.DI_KEY
+				AND EXISTS (
+					SELECT 'a'
+					FROM SKUMOVE
+					WHERE TRH_DI = SKM_DI
+					AND (trd.TRD_WL = SKM_WL OR trd.TRD_TO_WL = SKM_WL)
+					AND trd.TRD_SKU = SKM_SKU
+				)
+				JOIN WARELOCATION ON trd.TRD_WL = WL_KEY OR trd.TRD_TO_WL = WL_KEY
+				JOIN WAREHOUSE ON WL_WH = WH_KEY
+				INNER JOIN SKUMASTER ON trd.TRD_SKU = SKU_KEY
+				AND (SKU_STOCK <> 0)
+				AND (SKU_COST_TY >= 1)
+				AND (SKU_COST_TY <= 5)
+				JOIN ICCAT ON SKU_ICCAT = ICCAT_KEY
+				JOIN ICDEPT ON SKU_ICDEPT = ICDEPT_KEY
+				JOIN BRAND ON SKU_BRN = BRN_KEY
+				JOIN SKUAP ON SKU_KEY = SKP_SKU
+				AND (SKP_DEFAULT = 'Y')
+				JOIN APFILE ON SKP_AP = AP_KEY
+				JOIN UOFQTY ON SKU_T_UTQ = UTQ_KEY AND TRD_UTQNAME = UTQ_NAME
+				INNER JOIN GOODSMASTER ON GOODS_SKU = SKU_KEY AND GOODS_UTQ = UTQ_KEY
+			WHERE
+				(DI_DATE <= GETDATE())
+				AND (AP_ACCESS = 0)
+				AND (ICCAT_ACCESS = 0)
+				AND (BRN_ACCESS = 0)
+				AND (ICDEPT_ACCESS = 0)
+				AND (SKU_ACCESS = 0)
+				AND WL_CODE LIKE 'SALE%'
+				AND GOODS_CODE 
+				IN (SELECT DISTINCT GOODS_CODE FROM TRANSTKD as trd 
+
+					JOIN 
+						WARELOCATION ON trd.TRD_WL = WL_KEY OR trd.TRD_TO_WL = WL_KEY
+					INNER JOIN 
+						SKUMASTER ON trd.TRD_SKU = SKU_KEY
+					JOIN 
+						UOFQTY ON SKU_T_UTQ = UTQ_KEY AND TRD_UTQNAME = UTQ_NAME
+					INNER JOIN 
+						GOODSMASTER ON GOODS_SKU = SKU_KEY AND GOODS_UTQ = UTQ_KEY
+
+					WHERE
+						WL_CODE LIKE 'SALE%'
+						AND TRD_KEY > @trdKeyMin AND TRD_KEY <= @trdKeyMax)
+
+			GROUP BY
+			SKU_CODE,
+			GOODS_CODE,
+			WH_CODE,
+			WL_CODE,
+			UTQ_NAME,
+			SKU_NAME,
+			SKU_BARCODE,
+			SKU_E_NAME
+		) AS t
+
+		UNION
+
+		SELECT
+			SKU_CODE,
+			GOODS_CODE as SKU_BARCODE ,
+			WH_CODE,
+			WL_CODE,
+			NULL AS VAT,
+			NULL AS NON_VAT,
+			SUM(SKM_QTY) AS SUM_QTY,
+			UTQ_NAME,
+				SKU_NAME,
+				SKU_E_NAME
+		FROM
+			SKUMOVE
+			JOIN DOCINFO ON SKM_DI = DI_KEY
+			JOIN WARELOCATION ON SKM_WL = WL_KEY
+			JOIN WAREHOUSE ON WL_WH = WH_KEY
+			JOIN SKUMASTER ON SKM_SKU = SKU_KEY
+			AND (SKU_STOCK <> 0)
+			AND (SKU_COST_TY >= 1)
+			AND (SKU_COST_TY <= 5)
+			JOIN ICCAT ON SKU_ICCAT = ICCAT_KEY
+			JOIN ICDEPT ON SKU_ICDEPT = ICDEPT_KEY
+			JOIN BRAND ON SKU_BRN = BRN_KEY
+			JOIN SKUAP ON SKU_KEY = SKP_SKU
+			AND (SKP_DEFAULT = 'Y')
+			JOIN APFILE ON SKP_AP = AP_KEY
+			JOIN UOFQTY ON SKU_K_UTQ = UTQ_KEY 
+			INNER JOIN GOODSMASTER ON GOODS_SKU = SKU_KEY AND GOODS_UTQ = UTQ_KEY
+		WHERE
+			(DI_DATE <= GETDATE())
+			AND (AP_ACCESS = 0)
+			AND (ICCAT_ACCESS = 0)
+			AND (BRN_ACCESS = 0)
+			AND (ICDEPT_ACCESS = 0)
+			AND (SKU_ACCESS = 0)
+			AND WL_CODE NOT LIKE 'SALE%'
+			AND GOODS_CODE IN (SELECT DISTINCT GOODS_CODE FROM SKUMOVE 
+				JOIN 
+					WARELOCATION ON SKM_WL = WL_KEY
+				JOIN 
+					SKUMASTER ON SKM_SKU = SKU_KEY
+				JOIN 
+					UOFQTY ON SKU_K_UTQ = UTQ_KEY 
+				INNER JOIN 
+					GOODSMASTER ON GOODS_SKU = SKU_KEY AND GOODS_UTQ = UTQ_KEY
+				WHERE
+					WL_CODE NOT LIKE 'SALE%'
+					AND SKM_KEY > @skmKeyMin AND SKM_KEY <= @skmKeyMax)
+		GROUP BY
+			SKU_CODE,
+			GOODS_CODE,
+			WH_CODE,
+			WL_CODE,
+			UTQ_NAME,
+			SKU_NAME,
+			SKU_BARCODE,
+			SKU_E_NAME
+
+		ORDER BY SKU_CODE,WL_CODE
+	`
+
+		dcName, err := os.Hostname()
+		if err != nil {
+			fmt.Println("can't fetch host name:", err)
+			return "", "", trdKeyMin, skmKeyMin, err
+		}
+
+		currentUser, err := user.Current()
+		if err != nil {
+			fmt.Println("can't fetch current user:", err)
+			return "", "", trdKeyMin, skmKeyMin, err
+		}
+		epoch := time.Now().Unix()
+
+		fileName := fmt.Sprintf("%s_%s_%d.csv", dcName, currentUser.Username, epoch)
+		fileLogName := fmt.Sprintf("%s_%s_%d", dcName, currentUser.Username, epoch)
+		newFilename := strings.Replace(fileName, `\`, `_`, -1)
+		newFileLogname := strings.Replace(fileLogName, `\`, `_`, -1)
+
+		fmt.Println("Start Query")
+		writeToFile("log_"+newFileLogname+".txt", "Start Query")
+		rows, err := conn.Query(query, sql.Named("trdKeyMin", trdKeyMin), sql.Named("trdKeyMax", trdKeyMax), sql.Named("skmKeyMin", skmKeyMin), sql.Named("skmKeyMax", skmKeyMax))
+		if err != nil {
+			fmt.Println(err)
+			writeToFile("log_"+newFileLogname+"_error.txt", "Failed to query: "+err.Error())
+			return "", "", trdKeyMin, skmKeyMin, err
+		}
+		fmt.Println("Finish Query")
+		writeToFile("log_"+newFileLogname+".txt", "Finish Query")
+		defer rows.Close()
+
+		outputFile, err := os.Create(newFilename)
+		if err != nil {
+			fmt.Println(err)
+			writeToFile("log_"+newFileLogname+"_error.txt", "Failed to create file: "+err.Error())
+		}
+		defer outputFile.Close()
+
+		csvWriter := csv.NewWriter(outputFile)
+		defer csvWriter.Flush()
+
+		columns, err := rows.Columns()
+		if err != nil {
+			fmt.Println(err)
+			writeToFile("log_"+newFileLogname+"_error.txt", "Failed to create csv: "+err.Error())
+		}
+		csvWriter.Write(columns)
+
+		for rows.Next() {
+			var SKU_CODE, GOODS_CODE, WH_CODE, WL_CODE, UTQ_NAME, SKU_NAME, SKU_E_NAME string
+			var VAT, NON_VAT *float64
+			var SUM_QTY *float64
+			if err := rows.Scan(&SKU_CODE, &GOODS_CODE, &WH_CODE, &WL_CODE, &VAT, &NON_VAT, &SUM_QTY, &UTQ_NAME, &SKU_NAME, &SKU_E_NAME); err != nil {
+				fmt.Println(err)
+			}
+
+			if err := csvWriter.Write([]string{
+				SKU_CODE,
+				GOODS_CODE,
+				WH_CODE,
+				WL_CODE,
+				formatNullableFloat(VAT),
+				formatNullableFloat(NON_VAT),
+				formatNullableFloat(SUM_QTY),
+				UTQ_NAME,
+				SKU_NAME,
+				SKU_E_NAME,
+			}); err != nil {
+				fmt.Println(err)
+				writeToFile("log_"+newFileLogname+"_error.txt", "Failed to create csv: "+err.Error())
+			}
+			if err := rows.Err(); err != nil {
+				fmt.Println(err)
+				writeToFile("log_"+newFileLogname+"_error.txt", "Failed to create csv: "+err.Error())
+			}
+			fmt.Println("Success Create ", SKU_CODE)
+			writeToFile("log_"+newFileLogname+".txt", "Success Create "+SKU_CODE)
+		}
+		fmt.Println("CSV file generated successfully!")
+		writeToFile("log_"+newFileLogname+".txt", "CSV file generated successfully!")
+		return newFilename, newFileLogname, trdKeyMax, skmKeyMax, nil
+	}
+}
+func upload_to_minio(endpoint, accessKey, secretKey, bucketName, filename string, filelogname string, trdNewKey int64, skmNewKey int64) {
+
+	minioClient, err := minio.New(endpoint, &minio.Options{
+		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
+		Secure: true,
+	})
+	if err != nil {
+		fmt.Println("Failed to initialize Minio client:", err)
+		writeToFile("log_"+filelogname+"_error.txt", "Failed to initialize Minio client:"+err.Error())
+	}
+
+	file, err := os.Open(filename)
+	if err != nil {
+		fmt.Println("Failed to open file:", err)
+		writeToFile("log_"+filelogname+"_error.txt", "Failed to open file:"+err.Error())
+	}
+	defer file.Close()
+
+	fileInfo, err := file.Stat()
+	if err != nil {
+		fmt.Println("Failed to get file info:", err)
+		writeToFile("log_"+filelogname+"_error.txt", "Failed to get file info:"+err.Error())
+	}
+
+	_, err = minioClient.PutObject(context.Background(), bucketName, "pending_inventory_data/"+filename, file, fileInfo.Size(), minio.PutObjectOptions{})
+	if err != nil {
+		fmt.Println("Failed to upload file to Minio:", err)
+		writeToFile("log_"+filelogname+"_error.txt", "Failed to upload file to Minio:"+err.Error())
+	}
+	writeToFile("log_"+filelogname+".txt", fmt.Sprintf("Successfully uploaded "+filename))
+
+	logFile, err := os.Open("log_" + filelogname + ".txt")
+	if err != nil {
+		fmt.Println("Failed to open log file: ", err)
+		writeToFile("log_"+filelogname+"_error.txt", "Failed to open log file:"+err.Error())
+	}
+	defer logFile.Close()
+
+	logFileInfo, err := logFile.Stat()
+	if err != nil {
+		fmt.Println("Failed to get log file info: ", err)
+		writeToFile("log_"+filelogname+"_error.txt", "Failed to get log file info:"+err.Error())
+	}
+
+	_, err = minioClient.PutObject(context.Background(), bucketName, "log_inventory/sucess_bplus_log/"+"log_"+filelogname+".txt", logFile, logFileInfo.Size(), minio.PutObjectOptions{})
+	if err != nil {
+		fmt.Println("Failed to upload log to Minio: ", err)
+		writeToFile("log_"+filelogname+"_error.txt", "Failed to upload log to Minio:"+err.Error())
+	}
+
+	_, err = minioClient.PutObject(context.Background(), bucketName, "pending_inventory_data/"+filename, file, fileInfo.Size(), minio.PutObjectOptions{})
+	if err != nil {
+		fmt.Println("Failed to upload file to Minio:", err)
+		writeToFile("log_"+filelogname+"_error.txt", "Failed to upload file to Minio:"+err.Error())
+	}
+
+	writeToFile("log_"+filelogname+".txt", fmt.Sprintf("Successfully uploaded "+filename))
+	os.Remove("log" + filelogname + ".txt")
+	os.Remove("log" + filename + ".txt")
+	errorlogFile, err := os.Open("log_" + filelogname + "_error.txt")
+	if err != nil {
+		fmt.Println("Successfully uploaded data to Minio")
+	}
+	if err == nil {
+		defer logFile.Close()
+
+		errorlogFileInfo, err := logFile.Stat()
+		if err != nil {
+			fmt.Println("Error", err)
+		}
+		_, err = minioClient.PutObject(context.Background(), bucketName, "log_inventory/failed_bplus_log/"+"log_"+filename+".txt", errorlogFile, errorlogFileInfo.Size(), minio.PutObjectOptions{})
+		if err != nil {
+			fmt.Println("Failed to upload log to Minio: ", err)
+			writeToFile("log_"+filelogname+"_error.txt", "Failed to upload log to Minio:"+err.Error())
+		}
+		fmt.Println("Successfully uploaded log file to Minio")
+		os.Remove("log_" + filelogname + "_error.txt")
+	}
+	file, err = os.Open("TrdAndSkmData.csv")
+	if err != nil {
+		panic(err)
+	}
+	defer file.Close()
+	reader := csv.NewReader(file)
+	records, err := reader.ReadAll()
+	if err != nil {
+		panic(err)
+	}
+
+	records[1][0] = strconv.Itoa(int(trdNewKey))
+	records[1][1] = strconv.Itoa(int(skmNewKey))
+
+	file, err = os.Create("TrdAndSkmData.csv")
+	if err != nil {
+		panic(err)
+	}
+	defer file.Close()
+	writer := csv.NewWriter(file)
+	for _, record := range records {
+		err := writer.Write(record)
+		if err != nil {
+			panic(err)
+		}
+	}
+	writer.Flush()
+}
+
+func GetLastTrdAndSkmKey() (int64, int64, error) {
+	fmt.Println("Start")
+	TrdAndSkmData, err := os.Open("TrdAndSkmData.csv")
+	if err != nil {
+		return 0, 0, err
+	}
+	defer TrdAndSkmData.Close()
+
+	reader := csv.NewReader(TrdAndSkmData)
+
+	_, err = reader.Read()
+	if err != nil {
+		return 0, 0, err
+	}
+	record, err := reader.Read()
+	if err != nil {
+		return 0, 0, err
+	}
+	trdKeyMin, err := strconv.ParseInt(record[0], 10, 64)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	skmKeyMin, err := strconv.ParseInt(record[1], 10, 64)
+	if err != nil {
+		return 0, 0, err
+	}
+	return trdKeyMin, skmKeyMin, nil
+}
+
+func PKCS7Unpadding(plaintext []byte) ([]byte, error) {
+	length := len(plaintext)
+	padding := int(plaintext[length-1])
+	if padding > length || padding > aes.BlockSize {
+		return nil, fmt.Errorf("invalid padding size")
+	}
+
+	return plaintext[:length-padding], nil
+}
+
+func main() {
+	err := godotenv.Load()
+	if err != nil {
+		log.Fatal("Error loading .env file")
+	}
+
+	key := []byte("2zl85d7jABgG627oUmgtG8vgtTOWt3ti")
+
+	encryptedHex := os.Getenv("DB_PASSWORD")
+	if encryptedHex == "" {
+		panic("environment variable DB_PASSWORD is not set")
+	}
+
+	encrypted, err := hex.DecodeString(encryptedHex)
+	if err != nil {
+		panic(err)
+	}
+
+	if len(encrypted) < aes.BlockSize {
+		panic("ciphertext too short")
+	}
+	iv := encrypted[:aes.BlockSize]
+	ciphertext := encrypted[aes.BlockSize:]
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		panic(err)
+	}
+
+	decrypted := make([]byte, len(ciphertext))
+	stream := cipher.NewCBCDecrypter(block, iv)
+	stream.CryptBlocks(decrypted, ciphertext)
+
+	decrypted, err = PKCS7Unpadding(decrypted)
+	if err != nil {
+		panic(err)
+	}
+	password := decrypted
+
+	encryptedHex = os.Getenv("MINIO_ACCESS_KEY")
+	if encryptedHex == "" {
+		panic("environment variable MINIO_ACCESS_KEY is not set")
+	}
+
+	encrypted, err = hex.DecodeString(encryptedHex)
+	if err != nil {
+		panic(err)
+	}
+
+	if len(encrypted) < aes.BlockSize {
+		panic("ciphertext too short")
+	}
+	iv = encrypted[:aes.BlockSize]
+	ciphertext = encrypted[aes.BlockSize:]
+
+	block, err = aes.NewCipher(key)
+	if err != nil {
+		panic(err)
+	}
+
+	decrypted = make([]byte, len(ciphertext))
+	stream = cipher.NewCBCDecrypter(block, iv)
+	stream.CryptBlocks(decrypted, ciphertext)
+
+	decrypted, err = PKCS7Unpadding(decrypted)
+	if err != nil {
+		panic(err)
+	}
+	accessKey := string(decrypted)
+
+	encryptedHex = os.Getenv("MINIO_SECRET_KEY")
+	if encryptedHex == "" {
+		panic("environment variable MINIO_SECRET_KEY is not set")
+	}
+
+	encrypted, err = hex.DecodeString(encryptedHex)
+	if err != nil {
+		panic(err)
+	}
+
+	if len(encrypted) < aes.BlockSize {
+		panic("ciphertext too short")
+	}
+	iv = encrypted[:aes.BlockSize]
+	ciphertext = encrypted[aes.BlockSize:]
+
+	block, err = aes.NewCipher(key)
+	if err != nil {
+		panic(err)
+	}
+
+	decrypted = make([]byte, len(ciphertext))
+	stream = cipher.NewCBCDecrypter(block, iv)
+	stream.CryptBlocks(decrypted, ciphertext)
+
+	decrypted, err = PKCS7Unpadding(decrypted)
+	if err != nil {
+		panic(err)
+	}
+	secretKey := string(decrypted)
+
+	server := os.Getenv("DB_SERVER")
+	dbUser := os.Getenv("DB_USERNAME")
+
+	port, err := strconv.Atoi(os.Getenv("DB_PORT"))
+	database := os.Getenv("DB_DATABASE")
+	endpoint := os.Getenv("END_POINT")
+	bucketName := os.Getenv("MINIO_BUCKET_NAME")
+	connString := fmt.Sprintf("server=%s;user id=%s;password=%s;port=%d;database=%s", server, dbUser, password, port, database)
+	sleepTimeStr := os.Getenv("TIME_SLEEP")
+	sleepTime, err := strconv.Atoi(sleepTimeStr)
+	if err != nil {
+		fmt.Println("Error converting timesleep to integer:", err)
+		return
+	}
+	ticker := time.NewTicker(time.Duration(sleepTime) * time.Second)
+
+	defer ticker.Stop()
+	for {
+		trdKeyMin, skmKeyMin, err := GetLastTrdAndSkmKey()
+		if err != nil {
+			fmt.Println("Can't generate CSV file:", err)
+		} else {
+			fmt.Println(trdKeyMin, skmKeyMin)
+			filename, filelogname, trdNewKey, skmNewKey, err := generate_csv(connString, trdKeyMin, skmKeyMin)
+			if err != nil || filename == "" {
+				fmt.Println("Can't generate CSV file:", err)
+			} else {
+				upload_to_minio(endpoint, accessKey, secretKey, bucketName, filename, filelogname, trdNewKey, skmNewKey)
+				os.Remove(filename)
+				os.Remove("log_" + filelogname + ".txt")
+				os.Remove("log_" + filelogname + "_error.txt")
+			}
+		}
+		<-ticker.C
+	}
+}

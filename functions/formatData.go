@@ -67,9 +67,9 @@ func generate_csv(connectionString string) () {
 			return 
 		}
 		epoch := time.Now().Unix()
-		fileName := fmt.Sprintf("%s_%s_%d.csv", dcName, currentUser.Username, epoch)
+		// fileName := fmt.Sprintf("%s_%s_%d.csv", dcName, currentUser.Username, epoch)
 		fileLogName := fmt.Sprintf("%s_%s_%d", dcName, currentUser.Username, epoch)
-		newFilename := strings.Replace(fileName, `\`, `_`, -1)
+		// newFilename := strings.Replace(fileName, `\`, `_`, -1)
 		newFileLogname := strings.Replace(fileLogName, `\`, `_`, -1)
 		
 		fmt.Println("Start Query")
